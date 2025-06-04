@@ -1,42 +1,44 @@
-from typing import Optional, Union
+# app/dependencies.py
+from typing import Optional, Union, List
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.models.admin import AdminInDB, AdminValidationResult, Admin
 from app.models.user import UserResponse, UserStatus
-from app.db import Session, crud, get_db
+from app import db
 from config import SUDOERS
 from fastapi import Depends, HTTPException
 from datetime import datetime, timezone, timedelta
 from app.utils.jwt import get_subscription_payload
 
 
-def validate_admin(db: Session, username: str, password: str) -> Optional[AdminValidationResult]:
+async def validate_admin(username: str, password: str) -> Optional[AdminValidationResult]:
     """Validate admin credentials with environment variables or database."""
     if SUDOERS.get(username) == password:
         return AdminValidationResult(username=username, is_sudo=True)
 
-    dbadmin = crud.get_admin(db, username)
+    dbadmin = await db.get_admin(username)
     if dbadmin and AdminInDB.model_validate(dbadmin).verify_password(password):
         return AdminValidationResult(username=dbadmin.username, is_sudo=dbadmin.is_sudo)
 
     return None
 
 
-def get_admin_by_username(username: str, db: Session = Depends(get_db)):
+async def get_admin_by_username(username: str):
     """Fetch an admin by username from the database."""
-    dbadmin = crud.get_admin(db, username)
+    dbadmin = await db.get_admin(username)
     if not dbadmin:
         raise HTTPException(status_code=404, detail="Admin not found")
     return dbadmin
 
 
-def get_dbnode(node_id: int, db: Session = Depends(get_db)):
+async def get_dbnode(node_id: str):
     """Fetch a node by its ID from the database, raising a 404 error if not found."""
-    dbnode = crud.get_node_by_id(db, node_id)
+    dbnode = await db.get_node_by_id(node_id)
     if not dbnode:
         raise HTTPException(status_code=404, detail="Node not found")
     return dbnode
 
 
-def validate_dates(start: Optional[Union[str, datetime]], end: Optional[Union[str, datetime]]) -> (datetime, datetime):
+def validate_dates(start: Optional[Union[str, datetime]], end: Optional[Union[str, datetime]]) -> tuple[datetime, datetime]:
     """Validate if start and end dates are correct and if end is after start."""
     try:
         if start:
@@ -56,23 +58,20 @@ def validate_dates(start: Optional[Union[str, datetime]], end: Optional[Union[st
         raise HTTPException(status_code=400, detail="Invalid date range or format")
 
 
-def get_user_template(template_id: int, db: Session = Depends(get_db)):
+async def get_user_template(template_id: str):
     """Fetch a User Template by its ID, raise 404 if not found."""
-    dbuser_template = crud.get_user_template(db, template_id)
+    dbuser_template = await db.get_user_template_by_id(template_id)
     if not dbuser_template:
         raise HTTPException(status_code=404, detail="User Template not found")
     return dbuser_template
 
 
-def get_validated_sub(
-        token: str,
-        db: Session = Depends(get_db)
-) -> UserResponse:
+async def get_validated_sub(token: str) -> UserResponse:
     sub = get_subscription_payload(token)
     if not sub:
         raise HTTPException(status_code=404, detail="Not Found")
 
-    dbuser = crud.get_user(db, sub['username'])
+    dbuser = await db.get_user(sub['username'])
     if not dbuser or dbuser.created_at > sub['created_at']:
         raise HTTPException(status_code=404, detail="Not Found")
 
@@ -82,31 +81,30 @@ def get_validated_sub(
     return dbuser
 
 
-def get_validated_user(
-        username: str,
-        admin: Admin = Depends(Admin.get_current),
-        db: Session = Depends(get_db)
-) -> UserResponse:
-    dbuser = crud.get_user(db, username)
+async def get_validated_user(username: str, admin: Admin = Depends(Admin.get_current)) -> UserResponse:
+    dbuser = await db.get_user(username)
     if not dbuser:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not (admin.is_sudo or (dbuser.admin and dbuser.admin.username == admin.username)):
+    if not (admin.is_sudo or (dbuser.admin_id and str(dbuser.admin_id) == admin.username)):
         raise HTTPException(status_code=403, detail="You're not allowed")
 
     return dbuser
 
 
-def get_expired_users_list(db: Session, admin: Admin, expired_after: Optional[datetime] = None,
-                           expired_before: Optional[datetime] = None):
+async def get_expired_users_list(
+    admin: Admin, 
+    expired_after: Optional[datetime] = None,
+    expired_before: Optional[datetime] = None
+) -> List[UserResponse]:
     expired_before = expired_before or datetime.now(timezone.utc)
     expired_after = expired_after or datetime.min.replace(tzinfo=timezone.utc)
 
-    dbadmin = crud.get_admin(db, admin.username)
-    dbusers = crud.get_users(
-        db=db,
+    admin_filter = None if admin.is_sudo else admin.username
+    
+    dbusers = await db.get_users(
         status=[UserStatus.expired, UserStatus.limited],
-        admin=dbadmin if not admin.is_sudo else None
+        admin_username=admin_filter
     )
 
     return [

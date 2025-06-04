@@ -1,11 +1,8 @@
 from datetime import datetime
 from typing import TYPE_CHECKING
+import asyncio
 
-from sqlalchemy.orm import Session
-
-from app import logger, scheduler, xray
-from app.db import (GetDB, get_notification_reminder, get_users,
-                    start_user_expire, update_user_status, reset_user_by_next)
+from app import logger, scheduler, xray, db
 from app.models.user import ReminderType, UserResponse, UserStatus
 from app.utils import report
 from app.utils.helpers import (calculate_expiration_days,
@@ -17,16 +14,19 @@ if TYPE_CHECKING:
     from app.db.models import User
 
 
-def add_notification_reminders(db: Session, user: "User", now: datetime = datetime.utcnow()) -> None:
+async def add_notification_reminders(user: "User", now: datetime = datetime.utcnow()) -> None:
     if user.data_limit:
         usage_percent = calculate_usage_percent(user.used_traffic, user.data_limit)
 
         for percent in sorted(NOTIFY_REACHED_USAGE_PERCENT, reverse=True):
             if usage_percent >= percent:
-                if not get_notification_reminder(db, user.id, ReminderType.data_usage, threshold=percent):
-                    report.data_usage_percent_reached(
-                        db, usage_percent, UserResponse.model_validate(user),
-                        user.id, user.expire, threshold=percent
+                existing_reminder = await db.get_notification_reminder(
+                    user.id, ReminderType.data_usage, threshold=percent
+                )
+                if not existing_reminder:
+                    await report.data_usage_percent_reached(
+                        usage_percent, UserResponse.model_validate(user),
+                        str(user.id), user.expire, threshold=percent
                     )
                 break
 
@@ -35,86 +35,106 @@ def add_notification_reminders(db: Session, user: "User", now: datetime = dateti
 
         for days_left in sorted(NOTIFY_DAYS_LEFT):
             if expire_days <= days_left:
-                if not get_notification_reminder(db, user.id, ReminderType.expiration_date, threshold=days_left):
-                    report.expire_days_reached(
-                        db, expire_days, UserResponse.model_validate(user),
-                        user.id, user.expire, threshold=days_left
+                existing_reminder = await db.get_notification_reminder(
+                    user.id, ReminderType.expiration_date, threshold=days_left
+                )
+                if not existing_reminder:
+                    await report.expire_days_reached(
+                        expire_days, UserResponse.model_validate(user),
+                        str(user.id), user.expire, threshold=days_left
                     )
                 break
 
 
-def reset_user_by_next_report(db: Session, user: "User"):
-    user = reset_user_by_next(db, user)
+async def reset_user_by_next_report(user: "User"):
+    user = await db.reset_user_by_next(user)
+    
+    if user:
+        xray.operations.update_user(user)
+        await report.user_data_reset_by_next(
+            user=UserResponse.model_validate(user), 
+            user_admin=await db.get_admin_by_id(user.admin_id) if user.admin_id else None
+        )
 
-    xray.operations.update_user(user)
 
-    report.user_data_reset_by_next(user=UserResponse.model_validate(user), user_admin=user.admin)
-
-
-def review():
+async def review():
     now = datetime.utcnow()
     now_ts = now.timestamp()
-    with GetDB() as db:
-        for user in get_users(db, status=UserStatus.active):
+    
+    # Get active users
+    active_users = await db.get_users(status=UserStatus.active)
+    
+    for user in active_users:
+        limited = user.data_limit and user.used_traffic >= user.data_limit
+        expired = user.expire and user.expire <= now_ts
 
-            limited = user.data_limit and user.used_traffic >= user.data_limit
-            expired = user.expire and user.expire <= now_ts
+        # Check if user has next plan and should be reset
+        if (limited or expired) and hasattr(user, 'next_plan') and user.next_plan is not None:
+            next_plan = await db.get_next_plan_by_user_id(user.id)
+            if next_plan:
+                if next_plan.fire_on_either:
+                    await reset_user_by_next_report(user)
+                    continue
+                elif limited and expired:
+                    await reset_user_by_next_report(user)
+                    continue
 
-            if (limited or expired) and user.next_plan is not None:
-                if user.next_plan is not None:
+        if limited:
+            status = UserStatus.limited
+        elif expired:
+            status = UserStatus.expired
+        else:
+            if WEBHOOK_ADDRESS:
+                await add_notification_reminders(user, now)
+            continue
 
-                    if user.next_plan.fire_on_either:
-                        reset_user_by_next_report(db, user)
-                        continue
+        # Remove user from xray and update status
+        xray.operations.remove_user(user)
+        await db.update_user_status(user, status)
 
-                    elif limited and expired:
-                        reset_user_by_next_report(db, user)
-                        continue
+        await report.status_change(
+            username=user.username, 
+            status=status,
+            user=UserResponse.model_validate(user), 
+            user_admin=await db.get_admin_by_id(user.admin_id) if user.admin_id else None
+        )
 
-            if limited:
-                status = UserStatus.limited
-            elif expired:
-                status = UserStatus.expired
-            else:
-                if WEBHOOK_ADDRESS:
-                    add_notification_reminders(db, user, now)
-                continue
+        logger.info(f"User \"{user.username}\" status changed to {status}")
 
-            xray.operations.remove_user(user)
-            update_user_status(db, user, status)
+    # Review on_hold users
+    on_hold_users = await db.get_users(status=UserStatus.on_hold)
+    
+    for user in on_hold_users:
+        base_time = user.edit_at or user.created_at
+        base_timestamp = base_time.timestamp()
 
-            report.status_change(username=user.username, status=status,
-                                 user=UserResponse.model_validate(user), user_admin=user.admin)
+        # Check if the user is online after or at 'base_time'
+        if user.online_at and base_timestamp <= user.online_at.timestamp():
+            status = UserStatus.active
+        elif user.on_hold_timeout and (user.on_hold_timeout.timestamp() <= now_ts):
+            # If the user didn't connect within the timeout period, change status to "Active"
+            status = UserStatus.active
+        else:
+            continue
 
-            logger.info(f"User \"{user.username}\" status changed to {status}")
+        await db.update_user_status(user, status)
+        await db.start_user_expire(user)
 
-        for user in get_users(db, status=UserStatus.on_hold):
+        await report.status_change(
+            username=user.username, 
+            status=status,
+            user=UserResponse.model_validate(user), 
+            user_admin=await db.get_admin_by_id(user.admin_id) if user.admin_id else None
+        )
 
-            if user.edit_at:
-                base_time = datetime.timestamp(user.edit_at)
-            else:
-                base_time = datetime.timestamp(user.created_at)
-
-            # Check if the user is online After or at 'base_time'
-            if user.online_at and base_time <= datetime.timestamp(user.online_at):
-                status = UserStatus.active
-
-            elif user.on_hold_timeout and (datetime.timestamp(user.on_hold_timeout) <= (now_ts)):
-                # If the user didn't connect within the timeout period, change status to "Active"
-                status = UserStatus.active
-
-            else:
-                continue
-
-            update_user_status(db, user, status)
-            start_user_expire(db, user)
-
-            report.status_change(username=user.username, status=status,
-                                 user=UserResponse.model_validate(user), user_admin=user.admin)
-
-            logger.info(f"User \"{user.username}\" status changed to {status}")
+        logger.info(f"User \"{user.username}\" status changed to {status}")
 
 
-scheduler.add_job(review, 'interval',
+def review_sync():
+    """Synchronous wrapper for the async review function"""
+    asyncio.create_task(review())
+
+
+scheduler.add_job(review_sync, 'interval',
                   seconds=JOB_REVIEW_USERS_INTERVAL,
                   coalesce=True, max_instances=1)

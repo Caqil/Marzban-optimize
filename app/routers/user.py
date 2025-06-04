@@ -1,11 +1,10 @@
+# app/routers/user.py
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Union
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy.exc import IntegrityError
 
-from app import logger, xray
-from app.db import Session, crud, get_db
+from app import logger, xray, db
 from app.dependencies import get_expired_users_list, get_validated_user, validate_dates
 from app.models.admin import Admin
 from app.models.user import (
@@ -23,10 +22,9 @@ router = APIRouter(tags=["User"], prefix="/api", responses={401: responses._401}
 
 
 @router.post("/user", response_model=UserResponse, responses={400: responses._400, 409: responses._409})
-def add_user(
+async def add_user(
     new_user: UserCreate,
     bg: BackgroundTasks,
-    db: Session = Depends(get_db),
     admin: Admin = Depends(Admin.get_current),
 ):
     """
@@ -45,8 +43,6 @@ def add_user(
     - **next_plan**: Next user plan (resets after use).
     """
 
-    # TODO expire should be datetime instead of timestamp
-
     for proxy_type in new_user.proxies:
         if not xray.config.inbounds_by_protocol.get(proxy_type):
             raise HTTPException(
@@ -55,32 +51,30 @@ def add_user(
             )
 
     try:
-        dbuser = crud.create_user(
-            db, new_user, admin=crud.get_admin(db, admin.username)
-        )
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="User already exists")
+        dbuser = await db.create_user(new_user, admin.username)
+    except Exception as e:
+        if "duplicate" in str(e).lower():
+            raise HTTPException(status_code=409, detail="User already exists")
+        raise HTTPException(status_code=400, detail=str(e))
 
     bg.add_task(xray.operations.add_user, dbuser=dbuser)
     user = UserResponse.model_validate(dbuser)
-    report.user_created(user=user, user_id=dbuser.id, by=admin, user_admin=dbuser.admin)
+    bg.add_task(report.user_created, user=user, user_id=str(dbuser.id), by=admin, user_admin=await db.get_admin_by_id(dbuser.admin_id) if dbuser.admin_id else None)
     logger.info(f'New user "{dbuser.username}" added')
     return user
 
 
 @router.get("/user/{username}", response_model=UserResponse, responses={403: responses._403, 404: responses._404})
-def get_user(dbuser: UserResponse = Depends(get_validated_user)):
+async def get_user(dbuser: UserResponse = Depends(get_validated_user)):
     """Get user information"""
     return dbuser
 
 
 @router.put("/user/{username}", response_model=UserResponse, responses={400: responses._400, 403: responses._403, 404: responses._404})
-def modify_user(
+async def modify_user(
     modified_user: UserModify,
     bg: BackgroundTasks,
-    db: Session = Depends(get_db),
-    dbuser: UsersResponse = Depends(get_validated_user),
+    dbuser: UserResponse = Depends(get_validated_user),
     admin: Admin = Depends(Admin.get_current),
 ):
     """
@@ -109,7 +103,7 @@ def modify_user(
             )
 
     old_status = dbuser.status
-    dbuser = crud.update_user(db, dbuser, modified_user)
+    dbuser = await db.update_user(dbuser, modified_user)
     user = UserResponse.model_validate(dbuser)
 
     if user.status in [UserStatus.active, UserStatus.on_hold]:
@@ -117,7 +111,7 @@ def modify_user(
     else:
         bg.add_task(xray.operations.remove_user, dbuser=dbuser)
 
-    bg.add_task(report.user_updated, user=user, user_admin=dbuser.admin, by=admin)
+    bg.add_task(report.user_updated, user=user, user_admin=await db.get_admin_by_id(dbuser.admin_id) if dbuser.admin_id else None, by=admin)
 
     logger.info(f'User "{user.username}" modified')
 
@@ -127,7 +121,7 @@ def modify_user(
             username=user.username,
             status=user.status,
             user=user,
-            user_admin=dbuser.admin,
+            user_admin=await db.get_admin_by_id(dbuser.admin_id) if dbuser.admin_id else None,
             by=admin,
         )
         logger.info(
@@ -138,18 +132,20 @@ def modify_user(
 
 
 @router.delete("/user/{username}", responses={403: responses._403, 404: responses._404})
-def remove_user(
+async def remove_user(
     bg: BackgroundTasks,
-    db: Session = Depends(get_db),
     dbuser: UserResponse = Depends(get_validated_user),
     admin: Admin = Depends(Admin.get_current),
 ):
     """Remove a user"""
-    crud.remove_user(db, dbuser)
+    await db.remove_user(dbuser)
     bg.add_task(xray.operations.remove_user, dbuser=dbuser)
 
     bg.add_task(
-        report.user_deleted, username=dbuser.username, user_admin=Admin.model_validate(dbuser.admin), by=admin
+        report.user_deleted, 
+        username=dbuser.username, 
+        user_admin=Admin.model_validate(await db.get_admin_by_id(dbuser.admin_id)) if dbuser.admin_id else None, 
+        by=admin
     )
 
     logger.info(f'User "{dbuser.username}" deleted')
@@ -157,20 +153,22 @@ def remove_user(
 
 
 @router.post("/user/{username}/reset", response_model=UserResponse, responses={403: responses._403, 404: responses._404})
-def reset_user_data_usage(
+async def reset_user_data_usage(
     bg: BackgroundTasks,
-    db: Session = Depends(get_db),
     dbuser: UserResponse = Depends(get_validated_user),
     admin: Admin = Depends(Admin.get_current),
 ):
     """Reset user data usage"""
-    dbuser = crud.reset_user_data_usage(db=db, dbuser=dbuser)
+    dbuser = await db.reset_user_data_usage(dbuser)
     if dbuser.status in [UserStatus.active, UserStatus.on_hold]:
         bg.add_task(xray.operations.add_user, dbuser=dbuser)
 
     user = UserResponse.model_validate(dbuser)
     bg.add_task(
-        report.user_data_usage_reset, user=user, user_admin=dbuser.admin, by=admin
+        report.user_data_usage_reset, 
+        user=user, 
+        user_admin=await db.get_admin_by_id(dbuser.admin_id) if dbuser.admin_id else None, 
+        by=admin
     )
 
     logger.info(f'User "{dbuser.username}"\'s usage was reset')
@@ -178,20 +176,22 @@ def reset_user_data_usage(
 
 
 @router.post("/user/{username}/revoke_sub", response_model=UserResponse, responses={403: responses._403, 404: responses._404})
-def revoke_user_subscription(
+async def revoke_user_subscription(
     bg: BackgroundTasks,
-    db: Session = Depends(get_db),
     dbuser: UserResponse = Depends(get_validated_user),
     admin: Admin = Depends(Admin.get_current),
 ):
     """Revoke users subscription (Subscription link and proxies)"""
-    dbuser = crud.revoke_user_sub(db=db, dbuser=dbuser)
+    dbuser = await db.revoke_user_sub(dbuser)
 
     if dbuser.status in [UserStatus.active, UserStatus.on_hold]:
         bg.add_task(xray.operations.update_user, dbuser=dbuser)
     user = UserResponse.model_validate(dbuser)
     bg.add_task(
-        report.user_subscription_revoked, user=user, user_admin=dbuser.admin, by=admin
+        report.user_subscription_revoked, 
+        user=user, 
+        user_admin=await db.get_admin_by_id(dbuser.admin_id) if dbuser.admin_id else None, 
+        by=admin
     )
 
     logger.info(f'User "{dbuser.username}" subscription revoked')
@@ -200,7 +200,7 @@ def revoke_user_subscription(
 
 
 @router.get("/users", response_model=UsersResponse, responses={400: responses._400, 403: responses._403, 404: responses._404})
-def get_users(
+async def get_users(
     offset: int = None,
     limit: int = None,
     username: List[str] = Query(None),
@@ -208,30 +208,19 @@ def get_users(
     owner: Union[List[str], None] = Query(None, alias="admin"),
     status: UserStatus = None,
     sort: str = None,
-    db: Session = Depends(get_db),
     admin: Admin = Depends(Admin.get_current),
 ):
     """Get all users"""
-    if sort is not None:
-        opts = sort.strip(",").split(",")
-        sort = []
-        for opt in opts:
-            try:
-                sort.append(crud.UsersSortingOptions[opt])
-            except KeyError:
-                raise HTTPException(
-                    status_code=400, detail=f'"{opt}" is not a valid sort option'
-                )
-
-    users, count = crud.get_users(
-        db=db,
+    
+    admin_filter = owner if admin.is_sudo else [admin.username]
+    
+    users, count = await db.get_users(
         offset=offset,
         limit=limit,
         search=search,
         usernames=username,
         status=status,
-        sort=sort,
-        admins=owner if admin.is_sudo else [admin.username],
+        admin_username=admin_filter[0] if admin_filter else None,
         return_with_count=True,
     )
 
@@ -239,12 +228,9 @@ def get_users(
 
 
 @router.post("/users/reset", responses={403: responses._403, 404: responses._404})
-def reset_users_data_usage(
-    db: Session = Depends(get_db), admin: Admin = Depends(Admin.check_sudo_admin)
-):
+async def reset_users_data_usage(admin: Admin = Depends(Admin.check_sudo_admin)):
     """Reset all users data usage"""
-    dbadmin = crud.get_admin(db, admin.username)
-    crud.reset_all_users_data_usage(db=db, admin=dbadmin)
+    await db.reset_all_users_data_usage(admin.username)
     startup_config = xray.config.include_db_users()
     xray.core.restart(startup_config)
     for node_id, node in list(xray.nodes.items()):
@@ -254,30 +240,28 @@ def reset_users_data_usage(
 
 
 @router.get("/user/{username}/usage", response_model=UserUsagesResponse, responses={403: responses._403, 404: responses._404})
-def get_user_usage(
+async def get_user_usage(
     dbuser: UserResponse = Depends(get_validated_user),
     start: str = "",
     end: str = "",
-    db: Session = Depends(get_db),
 ):
     """Get users usage"""
     start, end = validate_dates(start, end)
 
-    usages = crud.get_user_usages(db, dbuser, start, end)
+    usages = await db.get_user_usages(dbuser, start, end)
 
     return {"usages": usages, "username": dbuser.username}
 
 
 @router.post("/user/{username}/active-next", response_model=UserResponse, responses={403: responses._403, 404: responses._404})
-def active_next_plan(
+async def active_next_plan(
     bg: BackgroundTasks,
-    db: Session = Depends(get_db),
     dbuser: UserResponse = Depends(get_validated_user),
 ):
     """Reset user by next plan"""
-    dbuser = crud.reset_user_by_next(db=db, dbuser=dbuser)
+    dbuser = await db.reset_user_by_next(dbuser)
 
-    if (dbuser is None or dbuser.next_plan is None):
+    if not dbuser or not dbuser.next_plan:
         raise HTTPException(
             status_code=404,
             detail=f"User doesn't have next plan",
@@ -288,7 +272,9 @@ def active_next_plan(
 
     user = UserResponse.model_validate(dbuser)
     bg.add_task(
-        report.user_data_reset_by_next, user=user, user_admin=dbuser.admin,
+        report.user_data_reset_by_next, 
+        user=user, 
+        user_admin=await db.get_admin_by_id(dbuser.admin_id) if dbuser.admin_id else None,
     )
 
     logger.info(f'User "{dbuser.username}"\'s usage was reset by next plan')
@@ -296,48 +282,49 @@ def active_next_plan(
 
 
 @router.get("/users/usage", response_model=UsersUsagesResponse)
-def get_users_usage(
+async def get_users_usage(
     start: str = "",
     end: str = "",
-    db: Session = Depends(get_db),
     owner: Union[List[str], None] = Query(None, alias="admin"),
     admin: Admin = Depends(Admin.get_current),
 ):
     """Get all users usage"""
     start, end = validate_dates(start, end)
 
-    usages = crud.get_all_users_usages(
-        db=db, start=start, end=end, admin=owner if admin.is_sudo else [admin.username]
+    admin_filter = owner if admin.is_sudo else [admin.username]
+    
+    usages = await db.get_all_users_usages(
+        start=start, 
+        end=end, 
+        admin_username=admin_filter[0] if admin_filter else None
     )
 
     return {"usages": usages}
 
 
 @router.put("/user/{username}/set-owner", response_model=UserResponse)
-def set_owner(
+async def set_owner(
     admin_username: str,
     dbuser: UserResponse = Depends(get_validated_user),
-    db: Session = Depends(get_db),
     admin: Admin = Depends(Admin.check_sudo_admin),
 ):
     """Set a new owner (admin) for a user."""
-    new_admin = crud.get_admin(db, username=admin_username)
+    new_admin = await db.get_admin(admin_username)
     if not new_admin:
         raise HTTPException(status_code=404, detail="Admin not found")
 
-    dbuser = crud.set_owner(db, dbuser, new_admin)
+    dbuser = await db.set_owner(dbuser, new_admin)
     user = UserResponse.model_validate(dbuser)
 
-    logger.info(f'{user.username}"owner successfully set to{admin.username}')
+    logger.info(f'{user.username} owner successfully set to {admin.username}')
 
     return user
 
 
 @router.get("/users/expired", response_model=List[str])
-def get_expired_users(
+async def get_expired_users(
     expired_after: Optional[datetime] = Query(None, example="2024-01-01T00:00:00"),
     expired_before: Optional[datetime] = Query(None, example="2024-01-31T23:59:59"),
-    db: Session = Depends(get_db),
     admin: Admin = Depends(Admin.get_current),
 ):
     """
@@ -351,16 +338,15 @@ def get_expired_users(
 
     expired_after, expired_before = validate_dates(expired_after, expired_before)
 
-    expired_users = get_expired_users_list(db, admin, expired_after, expired_before)
+    expired_users = await get_expired_users_list(admin, expired_after, expired_before)
     return [u.username for u in expired_users]
 
 
 @router.delete("/users/expired", response_model=List[str])
-def delete_expired_users(
+async def delete_expired_users(
     bg: BackgroundTasks,
     expired_after: Optional[datetime] = Query(None, example="2024-01-01T00:00:00"),
     expired_before: Optional[datetime] = Query(None, example="2024-01-31T23:59:59"),
-    db: Session = Depends(get_db),
     admin: Admin = Depends(Admin.get_current),
 ):
     """
@@ -372,7 +358,7 @@ def delete_expired_users(
     """
     expired_after, expired_before = validate_dates(expired_after, expired_before)
 
-    expired_users = get_expired_users_list(db, admin, expired_after, expired_before)
+    expired_users = await get_expired_users_list(admin, expired_after, expired_before)
     removed_users = [u.username for u in expired_users]
 
     if not removed_users:
@@ -380,7 +366,7 @@ def delete_expired_users(
             status_code=404, detail="No expired users found in the specified date range"
         )
 
-    crud.remove_users(db, expired_users)
+    await db.remove_users(expired_users)
 
     for removed_user in removed_users:
         logger.info(f'User "{removed_user}" deleted')
@@ -388,7 +374,7 @@ def delete_expired_users(
             report.user_deleted,
             username=removed_user,
             user_admin=next(
-                (u.admin for u in expired_users if u.username == removed_user), None
+                (Admin.model_validate(await db.get_admin_by_id(u.admin_id)) for u in expired_users if u.username == removed_user and u.admin_id), None
             ),
             by=admin,
         )

@@ -38,7 +38,6 @@ uvicorn==0.27.0.post1
 websocket-client==1.7.0
 websockets==12.0
 
-# MongoDB dependencies (replacing SQLAlchemy)
 motor==3.3.2
 pymongo==4.6.0
 dnspython==2.4.2

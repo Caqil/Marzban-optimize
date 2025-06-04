@@ -1,9 +1,9 @@
+# app/routers/system.py
 from typing import Dict, List, Union
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from app import __version__, xray
-from app.db import Session, crud, get_db
+from app import __version__, xray, db
 from app.models.admin import Admin
 from app.models.proxy import ProxyHost, ProxyInbound, ProxyTypes
 from app.models.system import SystemStats
@@ -15,32 +15,31 @@ router = APIRouter(tags=["System"], prefix="/api", responses={401: responses._40
 
 
 @router.get("/system", response_model=SystemStats)
-def get_system_stats(
-    db: Session = Depends(get_db), admin: Admin = Depends(Admin.get_current)
-):
+async def get_system_stats(admin: Admin = Depends(Admin.get_current)):
     """Fetch system stats including memory, CPU, and user metrics."""
     mem = memory_usage()
     cpu = cpu_usage()
-    system = crud.get_system_usage(db)
-    dbadmin: Union[Admin, None] = crud.get_admin(db, admin.username)
+    system = await db.get_system_usage()
+    
+    admin_filter = None if admin.is_sudo else admin.username
 
-    total_user = crud.get_users_count(db, admin=dbadmin if not admin.is_sudo else None)
-    users_active = crud.get_users_count(
-        db, status=UserStatus.active, admin=dbadmin if not admin.is_sudo else None
+    total_user = await db.get_users_count(admin_username=admin_filter)
+    users_active = await db.get_users_count(
+        status=UserStatus.active, admin_username=admin_filter
     )
-    users_disabled = crud.get_users_count(
-        db, status=UserStatus.disabled, admin=dbadmin if not admin.is_sudo else None
+    users_disabled = await db.get_users_count(
+        status=UserStatus.disabled, admin_username=admin_filter
     )
-    users_on_hold = crud.get_users_count(
-        db, status=UserStatus.on_hold, admin=dbadmin if not admin.is_sudo else None
+    users_on_hold = await db.get_users_count(
+        status=UserStatus.on_hold, admin_username=admin_filter
     )
-    users_expired = crud.get_users_count(
-        db, status=UserStatus.expired, admin=dbadmin if not admin.is_sudo else None
+    users_expired = await db.get_users_count(
+        status=UserStatus.expired, admin_username=admin_filter
     )
-    users_limited = crud.get_users_count(
-        db, status=UserStatus.limited, admin=dbadmin if not admin.is_sudo else None
+    users_limited = await db.get_users_count(
+        status=UserStatus.limited, admin_username=admin_filter
     )
-    online_users = crud.count_online_users(db, 24)
+    online_users = await db.count_online_users(24)
     realtime_bandwidth_stats = realtime_bandwidth()
 
     return SystemStats(
@@ -56,15 +55,15 @@ def get_system_stats(
         users_expired=users_expired,
         users_limited=users_limited,
         users_on_hold=users_on_hold,
-        incoming_bandwidth=system.uplink,
-        outgoing_bandwidth=system.downlink,
+        incoming_bandwidth=system.uplink if system else 0,
+        outgoing_bandwidth=system.downlink if system else 0,
         incoming_bandwidth_speed=realtime_bandwidth_stats.incoming_bytes,
         outgoing_bandwidth_speed=realtime_bandwidth_stats.outgoing_bytes,
     )
 
 
 @router.get("/inbounds", response_model=Dict[ProxyTypes, List[ProxyInbound]])
-def get_inbounds(admin: Admin = Depends(Admin.get_current)):
+async def get_inbounds(admin: Admin = Depends(Admin.get_current)):
     """Retrieve inbound configurations grouped by protocol."""
     return xray.config.inbounds_by_protocol
 
@@ -72,20 +71,19 @@ def get_inbounds(admin: Admin = Depends(Admin.get_current)):
 @router.get(
     "/hosts", response_model=Dict[str, List[ProxyHost]], responses={403: responses._403}
 )
-def get_hosts(
-    db: Session = Depends(get_db), admin: Admin = Depends(Admin.check_sudo_admin)
-):
+async def get_hosts(admin: Admin = Depends(Admin.check_sudo_admin)):
     """Get a list of proxy hosts grouped by inbound tag."""
-    hosts = {tag: crud.get_hosts(db, tag) for tag in xray.config.inbounds_by_tag}
+    hosts = {}
+    for tag in xray.config.inbounds_by_tag:
+        hosts[tag] = await db.get_hosts(tag)
     return hosts
 
 
 @router.put(
     "/hosts", response_model=Dict[str, List[ProxyHost]], responses={403: responses._403}
 )
-def modify_hosts(
+async def modify_hosts(
     modified_hosts: Dict[str, List[ProxyHost]],
-    db: Session = Depends(get_db),
     admin: Admin = Depends(Admin.check_sudo_admin),
 ):
     """Modify proxy hosts and update the configuration."""
@@ -96,8 +94,11 @@ def modify_hosts(
             )
 
     for inbound_tag, hosts in modified_hosts.items():
-        crud.update_hosts(db, inbound_tag, hosts)
+        await db.update_hosts(inbound_tag, hosts)
 
     xray.hosts.update()
 
-    return {tag: crud.get_hosts(db, tag) for tag in xray.config.inbounds_by_tag}
+    hosts_result = {}
+    for tag in xray.config.inbounds_by_tag:
+        hosts_result[tag] = await db.get_hosts(tag)
+    return hosts_result

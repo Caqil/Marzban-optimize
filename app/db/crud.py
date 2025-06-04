@@ -1,495 +1,585 @@
-# app/db/crud.py
-"""
-Functions for managing proxy hosts, users, user templates, nodes, and administrative tasks with MongoDB.
-"""
+# Additional functions to add to app/db/crud.py
 
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Union
 from bson import ObjectId
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union
 from motor.motor_asyncio import AsyncIOMotorCollection
-import pymongo
-
 from app.db.base import get_database, COLLECTIONS
 from app.db.models import (
-    Admin, AdminUsageLogs, NextPlan, Node, NodeUsage, NodeUserUsage,
-    NotificationReminder, Proxy, ProxyHost, ProxyInbound, System, TLS, JWT,
-    User, UserTemplate, UserUsageResetLogs, PyObjectId
+    Admin, Node, NodeUsage, NodeUserUsage, System, User, UserTemplate,
+    NotificationReminder, AdminUsageLogs, UserUsageResetLogs, PyObjectId
 )
-from app.models.admin import AdminCreate, AdminModify, AdminPartialModify
-from app.models.node import NodeCreate, NodeModify, NodeStatus, NodeUsageResponse
-from app.models.proxy import ProxyHost as ProxyHostModify
-from app.models.user import (
-    ReminderType, UserCreate, UserDataLimitResetStrategy,
-    UserModify, UserResponse, UserStatus, UserUsageResponse,
-)
-from app.models.user_template import UserTemplateCreate, UserTemplateModify
-from app.utils.helpers import calculate_expiration_days, calculate_usage_percent
-from config import NOTIFY_DAYS_LEFT, NOTIFY_REACHED_USAGE_PERCENT, USERS_AUTODELETE_DAYS
+from app.models.admin import AdminModify
+from app.models.node import NodeModify, NodeStatus, NodeUsageResponse
+from app.models.user import UserStatus, UserUsageResponse
 
-# Helper functions for database operations
-def get_collection(collection_name: str) -> AsyncIOMotorCollection:
-    """Get MongoDB collection"""
-    db = get_database()
-    return db[COLLECTIONS[collection_name]]
+# Additional CRUD functions that were missing
 
-async def create_indexes():
-    """Create necessary indexes for MongoDB collections"""
-    # User indexes
-    users_col = get_collection("users")
-    await users_col.create_index("username", unique=True)
-    await users_col.create_index("admin_id")
-    await users_col.create_index("status")
+async def get_admins(offset: Optional[int] = None, limit: Optional[int] = None, username: Optional[str] = None) -> List[Admin]:
+    """Get all admins with optional filtering."""
+    admins_col = get_database()[COLLECTIONS["admins"]]
     
-    # Admin indexes
-    admins_col = get_collection("admins")
-    await admins_col.create_index("username", unique=True)
-    
-    # Node indexes
-    nodes_col = get_collection("nodes")
-    await nodes_col.create_index("name", unique=True)
-    
-    # ProxyInbound indexes
-    inbounds_col = get_collection("proxy_inbounds")
-    await inbounds_col.create_index("tag", unique=True)
-    
-    # Usage indexes
-    node_user_usages_col = get_collection("node_user_usages") 
-    await node_user_usages_col.create_index([
-        ("created_at", 1), ("user_id", 1), ("node_id", 1)
-    ], unique=True)
-    
-    node_usages_col = get_collection("node_usages")
-    await node_usages_col.create_index([
-        ("created_at", 1), ("node_id", 1)
-    ], unique=True)
-
-# Proxy Host Operations
-async def add_default_host(inbound_tag: str):
-    """Adds a default host to a proxy inbound."""
-    host_data = {
-        "remark": "🚀 Marz ({USERNAME}) [{PROTOCOL} - {TRANSPORT}]",
-        "address": "{SERVER_IP}",
-        "inbound_tag": inbound_tag
-    }
-    host = ProxyHost(**host_data)
-    hosts_col = get_collection("proxy_hosts")
-    await hosts_col.insert_one(host.model_dump(by_alias=True))
-
-async def get_or_create_inbound(inbound_tag: str) -> ProxyInbound:
-    """Retrieves or creates a proxy inbound based on the given tag."""
-    inbounds_col = get_collection("proxy_inbounds")
-    inbound_doc = await inbounds_col.find_one({"tag": inbound_tag})
-    
-    if not inbound_doc:
-        inbound = ProxyInbound(tag=inbound_tag)
-        await inbounds_col.insert_one(inbound.model_dump(by_alias=True))
-        await add_default_host(inbound_tag)
-        inbound_doc = await inbounds_col.find_one({"tag": inbound_tag})
-    
-    return ProxyInbound(**inbound_doc)
-
-async def get_hosts(inbound_tag: str) -> List[ProxyHost]:
-    """Retrieves hosts for a given inbound tag."""
-    await get_or_create_inbound(inbound_tag)
-    hosts_col = get_collection("proxy_hosts")
-    hosts_docs = await hosts_col.find({"inbound_tag": inbound_tag}).to_list(length=None)
-    return [ProxyHost(**doc) for doc in hosts_docs]
-
-async def add_host(inbound_tag: str, host: ProxyHostModify) -> List[ProxyHost]:
-    """Adds a new host to a proxy inbound."""
-    await get_or_create_inbound(inbound_tag)
-    
-    host_data = host.model_dump()
-    host_data["inbound_tag"] = inbound_tag
-    new_host = ProxyHost(**host_data)
-    
-    hosts_col = get_collection("proxy_hosts")
-    await hosts_col.insert_one(new_host.model_dump(by_alias=True))
-    
-    return await get_hosts(inbound_tag)
-
-async def update_hosts(inbound_tag: str, modified_hosts: List[ProxyHostModify]) -> List[ProxyHost]:
-    """Updates hosts for a given inbound tag."""
-    await get_or_create_inbound(inbound_tag)
-    
-    hosts_col = get_collection("proxy_hosts")
-    # Delete existing hosts for this inbound
-    await hosts_col.delete_many({"inbound_tag": inbound_tag})
-    
-    # Insert new hosts
-    if modified_hosts:
-        hosts_data = []
-        for host in modified_hosts:
-            host_data = host.model_dump()
-            host_data["inbound_tag"] = inbound_tag
-            hosts_data.append(ProxyHost(**host_data).model_dump(by_alias=True))
-        
-        await hosts_col.insert_many(hosts_data)
-    
-    return await get_hosts(inbound_tag)
-
-# User Operations
-async def get_user(username: str) -> Optional[User]:
-    """Retrieves a user by username."""
-    users_col = get_collection("users")
-    user_doc = await users_col.find_one({"username": username})
-    return User(**user_doc) if user_doc else None
-
-async def get_user_by_id(user_id: Union[str, ObjectId]) -> Optional[User]:
-    """Retrieves a user by user ID."""
-    users_col = get_collection("users")
-    user_doc = await users_col.find_one({"_id": ObjectId(user_id)})
-    return User(**user_doc) if user_doc else None
-
-async def get_users(
-    offset: Optional[int] = None,
-    limit: Optional[int] = None,
-    usernames: Optional[List[str]] = None,
-    search: Optional[str] = None,
-    status: Optional[Union[UserStatus, list]] = None,
-    admin_username: Optional[str] = None,
-    reset_strategy: Optional[Union[UserDataLimitResetStrategy, list]] = None,
-    return_with_count: bool = False
-) -> Union[List[User], Tuple[List[User], int]]:
-    """Retrieves users based on various filters and options."""
-    users_col = get_collection("users")
-    
-    # Build query
     query = {}
+    if username:
+        query["username"] = {"$regex": username, "$options": "i"}
     
-    if search:
-        query["$or"] = [
-            {"username": {"$regex": search, "$options": "i"}},
-            {"note": {"$regex": search, "$options": "i"}}
-        ]
+    cursor = admins_col.find(query)
     
-    if usernames:
-        query["username"] = {"$in": usernames}
-    
-    if status:
-        if isinstance(status, list):
-            query["status"] = {"$in": status}
-        else:
-            query["status"] = status
-    
-    if reset_strategy:
-        if isinstance(reset_strategy, list):
-            query["data_limit_reset_strategy"] = {"$in": reset_strategy}
-        else:
-            query["data_limit_reset_strategy"] = reset_strategy
-    
-    if admin_username:
-        # Get admin ID first
-        admin = await get_admin(admin_username)
-        if admin:
-            query["admin_id"] = admin.id
-    
-    # Get count if needed
-    count = 0
-    if return_with_count:
-        count = await users_col.count_documents(query)
-    
-    # Build cursor
-    cursor = users_col.find(query)
-    
-    # Apply pagination
     if offset:
         cursor = cursor.skip(offset)
     if limit:
         cursor = cursor.limit(limit)
     
-    # Execute query
-    users_docs = await cursor.to_list(length=None)
-    users = [User(**doc) for doc in users_docs]
-    
-    if return_with_count:
-        return users, count
-    return users
+    admins_docs = await cursor.to_list(length=None)
+    return [Admin(**doc) for doc in admins_docs]
 
-async def get_user_usages(user: User, start: datetime, end: datetime) -> List[UserUsageResponse]:
-    """Retrieves user usages within a specified date range."""
-    usages = {None: UserUsageResponse(
-        node_id=None,
-        node_name="Master", 
-        used_traffic=0
-    )}
+
+async def update_admin(admin: Admin, modify: AdminModify) -> Admin:
+    """Update admin details."""
+    admins_col = get_database()[COLLECTIONS["admins"]]
     
-    # Get all nodes
-    nodes_col = get_collection("nodes")
-    nodes_docs = await nodes_col.find({}).to_list(length=None)
-    for node_doc in nodes_docs:
-        node = Node(**node_doc)
-        usages[str(node.id)] = UserUsageResponse(
-            node_id=str(node.id),
-            node_name=node.name,
-            used_traffic=0
+    update_data = modify.model_dump(exclude_unset=True)
+    if 'password' in update_data:
+        # Hash the password if provided
+        from app.models.admin import AdminInDB
+        admin_data = AdminInDB(**admin.model_dump())
+        admin_data.set_password(update_data['password'])
+        update_data['hashed_password'] = admin_data.hashed_password
+        del update_data['password']
+    
+    await admins_col.update_one(
+        {"_id": admin.id},
+        {"$set": update_data}
+    )
+    
+    updated_doc = await admins_col.find_one({"_id": admin.id})
+    return Admin(**updated_doc)
+
+
+async def remove_admin(admin: Admin) -> None:
+    """Remove an admin."""
+    admins_col = get_database()[COLLECTIONS["admins"]]
+    await admins_col.delete_one({"_id": admin.id})
+
+
+async def reset_admin_usage(admin: Admin) -> Admin:
+    """Reset admin usage."""
+    admins_col = get_database()[COLLECTIONS["admins"]]
+    admin_usage_logs_col = get_database()[COLLECTIONS["admin_usage_logs"]]
+    
+    # Log current usage before reset
+    log = AdminUsageLogs(
+        admin_id=admin.id,
+        used_traffic_at_reset=admin.users_usage
+    )
+    await admin_usage_logs_col.insert_one(log.model_dump(by_alias=True))
+    
+    # Reset usage
+    await admins_col.update_one(
+        {"_id": admin.id},
+        {"$set": {"users_usage": 0}}
+    )
+    
+    updated_doc = await admins_col.find_one({"_id": admin.id})
+    return Admin(**updated_doc)
+
+
+async def disable_all_active_users(admin_username: str) -> None:
+    """Disable all active users under a specific admin."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    admin = await get_admin(admin_username)
+    
+    if admin:
+        await users_col.update_many(
+            {"admin_id": admin.id, "status": UserStatus.active},
+            {"$set": {"status": UserStatus.disabled}}
+        )
+
+
+async def activate_all_disabled_users(admin_username: str) -> None:
+    """Activate all disabled users under a specific admin."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    admin = await get_admin(admin_username)
+    
+    if admin:
+        await users_col.update_many(
+            {"admin_id": admin.id, "status": UserStatus.disabled},
+            {"$set": {"status": UserStatus.active}}
+        )
+
+
+async def reset_user_data_usage(user: User) -> User:
+    """Reset user data usage."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    user_usage_logs_col = get_database()[COLLECTIONS["user_usage_logs"]]
+    
+    # Log current usage before reset
+    log = UserUsageResetLogs(
+        user_id=user.id,
+        used_traffic_at_reset=user.used_traffic
+    )
+    await user_usage_logs_col.insert_one(log.model_dump(by_alias=True))
+    
+    # Reset usage
+    await users_col.update_one(
+        {"_id": user.id},
+        {"$set": {"used_traffic": 0}}
+    )
+    
+    updated_doc = await users_col.find_one({"_id": user.id})
+    return User(**updated_doc)
+
+
+async def revoke_user_sub(user: User) -> User:
+    """Revoke user subscription."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    proxies_col = get_database()[COLLECTIONS["proxies"]]
+    
+    # Update revoke timestamp
+    await users_col.update_one(
+        {"_id": user.id},
+        {"$set": {"sub_revoked_at": datetime.utcnow()}}
+    )
+    
+    # Regenerate proxy settings (new UUIDs, passwords, etc.)
+    proxies = await proxies_col.find({"user_id": user.id}).to_list(length=None)
+    for proxy_doc in proxies:
+        # Generate new settings based on proxy type
+        from app.models.proxy import ProxySettings, ProxyTypes
+        proxy_type = ProxyTypes(proxy_doc["type"])
+        new_settings = proxy_type.settings_model()
+        new_settings.revoke()  # Generate new credentials
+        
+        await proxies_col.update_one(
+            {"_id": proxy_doc["_id"]},
+            {"$set": {"settings": new_settings.model_dump()}}
         )
     
-    # Get usage data
-    node_user_usages_col = get_collection("node_user_usages")
-    usage_docs = await node_user_usages_col.find({
-        "user_id": user.id,
-        "created_at": {"$gte": start, "$lte": end}
-    }).to_list(length=None)
-    
-    for usage_doc in usage_docs:
-        usage = NodeUserUsage(**usage_doc)
-        node_key = str(usage.node_id) if usage.node_id else None
-        if node_key in usages:
-            usages[node_key].used_traffic += usage.used_traffic
-    
-    return list(usages.values())
+    updated_doc = await users_col.find_one({"_id": user.id})
+    return User(**updated_doc)
 
-async def get_users_count(status: UserStatus = None, admin_username: str = None) -> int:
-    """Retrieves the count of users based on status and admin filters."""
-    users_col = get_collection("users")
-    query = {}
-    
-    if status:
-        query["status"] = status
-    
-    if admin_username:
-        admin = await get_admin(admin_username)
-        if admin:
-            query["admin_id"] = admin.id
-    
-    return await users_col.count_documents(query)
 
-async def create_user(user: UserCreate, admin_username: str = None) -> User:
-    """Creates a new user with provided details."""
-    user_data = user.model_dump()
+async def reset_user_by_next(user: User) -> Optional[User]:
+    """Reset user by next plan."""
+    if not user.next_plan:
+        return None
     
-    # Handle admin relationship
-    if admin_username:
-        admin = await get_admin(admin_username)
-        if admin:
-            user_data["admin_id"] = admin.id
+    users_col = get_database()[COLLECTIONS["users"]]
+    next_plans_col = get_database()[COLLECTIONS["next_plans"]]
     
-    # Create user document
-    db_user = User(**user_data)
+    # Get next plan
+    next_plan_doc = await next_plans_col.find_one({"user_id": user.id})
+    if not next_plan_doc:
+        return None
     
-    # Insert user
-    users_col = get_collection("users")
-    result = await users_col.insert_one(db_user.model_dump(by_alias=True))
-    
-    # Create proxies
-    proxies_col = get_collection("proxies")
-    for proxy_type, settings in user.proxies.items():
-        excluded_tags = user.excluded_inbounds.get(proxy_type, [])
-        proxy = Proxy(
-            user_id=result.inserted_id,
-            type=proxy_type,
-            settings=settings.model_dump(),
-            excluded_inbound_tags=excluded_tags
-        )
-        await proxies_col.insert_one(proxy.model_dump(by_alias=True))
-    
-    # Create next plan if provided
-    if user.next_plan:
-        next_plans_col = get_collection("next_plans")
-        next_plan = NextPlan(
-            user_id=result.inserted_id,
-            data_limit=user.next_plan.data_limit,
-            expire=user.next_plan.expire,
-            add_remaining_traffic=user.next_plan.add_remaining_traffic,
-            fire_on_either=user.next_plan.fire_on_either
-        )
-        await next_plans_col.insert_one(next_plan.model_dump(by_alias=True))
-    
-    # Return created user
-    return await get_user_by_id(result.inserted_id)
-
-async def remove_user(user: User) -> User:
-    """Removes a user from the database."""
-    users_col = get_collection("users")
-    proxies_col = get_collection("proxies")
-    next_plans_col = get_collection("next_plans")
-    
-    # Delete related documents
-    await proxies_col.delete_many({"user_id": user.id})
-    await next_plans_col.delete_many({"user_id": user.id})
-    
-    # Delete user
-    await users_col.delete_one({"_id": user.id})
-    
-    return user
-
-async def update_user(user: User, modify: UserModify) -> User:
-    """Updates a user with new details."""
     update_data = {}
     
-    # Handle basic fields
-    for field, value in modify.model_dump(exclude_unset=True).items():
-        if field not in ['proxies', 'excluded_inbounds', 'next_plan']:
-            update_data[field] = value
+    # Apply next plan data
+    if next_plan_doc.get("data_limit") is not None:
+        if next_plan_doc.get("add_remaining_traffic"):
+            remaining = max(0, user.data_limit - user.used_traffic) if user.data_limit else 0
+            update_data["data_limit"] = next_plan_doc["data_limit"] + remaining
+        else:
+            update_data["data_limit"] = next_plan_doc["data_limit"]
+        
+        update_data["used_traffic"] = 0
     
-    # Update edit timestamp
-    update_data["edit_at"] = datetime.utcnow()
+    if next_plan_doc.get("expire") is not None:
+        update_data["expire"] = next_plan_doc["expire"]
     
-    # Update user document
-    users_col = get_collection("users")
+    # Set status to active
+    update_data["status"] = UserStatus.active
+    
+    # Update user
     await users_col.update_one(
         {"_id": user.id},
         {"$set": update_data}
     )
     
-    # Handle proxies update
-    if modify.proxies:
-        proxies_col = get_collection("proxies")
-        
-        # Delete existing proxies
-        await proxies_col.delete_many({"user_id": user.id})
-        
-        # Insert new proxies
-        for proxy_type, settings in modify.proxies.items():
-            excluded_tags = modify.excluded_inbounds.get(proxy_type, [])
-            proxy = Proxy(
-                user_id=user.id,
-                type=proxy_type,
-                settings=settings.model_dump(),
-                excluded_inbound_tags=excluded_tags
+    # Remove next plan
+    await next_plans_col.delete_one({"user_id": user.id})
+    
+    updated_doc = await users_col.find_one({"_id": user.id})
+    return User(**updated_doc)
+
+
+async def reset_all_users_data_usage(admin_username: str) -> None:
+    """Reset all users data usage for a specific admin."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    
+    if admin_username:
+        admin = await get_admin(admin_username)
+        if admin:
+            await users_col.update_many(
+                {"admin_id": admin.id},
+                {"$set": {"used_traffic": 0}}
             )
-            await proxies_col.insert_one(proxy.model_dump(by_alias=True))
-    
-    # Handle next plan update
-    next_plans_col = get_collection("next_plans")
-    await next_plans_col.delete_many({"user_id": user.id})
-    
-    if modify.next_plan:
-        next_plan = NextPlan(
-            user_id=user.id,
-            data_limit=modify.next_plan.data_limit,
-            expire=modify.next_plan.expire,
-            add_remaining_traffic=modify.next_plan.add_remaining_traffic,
-            fire_on_either=modify.next_plan.fire_on_either
+    else:
+        # Super admin - reset all users
+        await users_col.update_many(
+            {},
+            {"$set": {"used_traffic": 0}}
         )
-        await next_plans_col.insert_one(next_plan.model_dump(by_alias=True))
+
+
+async def set_owner(user: User, new_admin: Admin) -> User:
+    """Set new owner (admin) for a user."""
+    users_col = get_database()[COLLECTIONS["users"]]
     
-    return await get_user_by_id(user.id)
-
-# Admin Operations
-async def get_admin(username: str) -> Optional[Admin]:
-    """Retrieves an admin by username."""
-    admins_col = get_collection("admins")
-    admin_doc = await admins_col.find_one({"username": username})
-    return Admin(**admin_doc) if admin_doc else None
-
-async def create_admin(admin: AdminCreate) -> Admin:
-    """Creates a new admin in the database."""
-    admin_data = admin.model_dump()
-    admin_data["hashed_password"] = admin.hashed_password
-    
-    db_admin = Admin(**admin_data)
-    
-    admins_col = get_collection("admins")
-    result = await admins_col.insert_one(db_admin.model_dump(by_alias=True))
-    
-    return await get_admin_by_id(result.inserted_id)
-
-async def get_admin_by_id(admin_id: Union[str, ObjectId]) -> Optional[Admin]:
-    """Retrieves an admin by their ID."""
-    admins_col = get_collection("admins")
-    admin_doc = await admins_col.find_one({"_id": ObjectId(admin_id)})
-    return Admin(**admin_doc) if admin_doc else None
-
-# System Operations
-async def get_system_usage() -> Optional[System]:
-    """Retrieves system usage information."""
-    system_col = get_collection("system")
-    system_doc = await system_col.find_one({})
-    return System(**system_doc) if system_doc else None
-
-async def get_jwt_secret_key() -> str:
-    """Retrieves the JWT secret key."""
-    jwt_col = get_collection("jwt")
-    jwt_doc = await jwt_col.find_one({})
-    if not jwt_doc:
-        # Create default JWT secret
-        import os
-        jwt_data = JWT(secret_key=os.urandom(32).hex())
-        await jwt_col.insert_one(jwt_data.model_dump(by_alias=True))
-        return jwt_data.secret_key
-    return jwt_doc["secret_key"]
-
-async def get_tls_certificate() -> Optional[TLS]:
-    """Retrieves the TLS certificate."""
-    tls_col = get_collection("tls")
-    tls_doc = await tls_col.find_one({})
-    return TLS(**tls_doc) if tls_doc else None
-
-# Node Operations  
-async def get_node(name: str) -> Optional[Node]:
-    """Retrieves a node by its name."""
-    nodes_col = get_collection("nodes")
-    node_doc = await nodes_col.find_one({"name": name})
-    return Node(**node_doc) if node_doc else None
-
-async def get_node_by_id(node_id: Union[str, ObjectId]) -> Optional[Node]:
-    """Retrieves a node by its ID."""
-    nodes_col = get_collection("nodes")
-    node_doc = await nodes_col.find_one({"_id": ObjectId(node_id)})
-    return Node(**node_doc) if node_doc else None
-
-async def create_node(node: NodeCreate) -> Node:
-    """Creates a new node in the database."""
-    db_node = Node(**node.model_dump())
-    
-    nodes_col = get_collection("nodes")
-    result = await nodes_col.insert_one(db_node.model_dump(by_alias=True))
-    
-    return await get_node_by_id(result.inserted_id)
-
-# Notification Operations
-async def create_notification_reminder(
-    reminder_type: ReminderType, 
-    expires_at: datetime, 
-    user_id: Union[str, ObjectId], 
-    threshold: Optional[int] = None
-) -> NotificationReminder:
-    """Creates a new notification reminder."""
-    reminder = NotificationReminder(
-        type=reminder_type,
-        expires_at=expires_at,
-        user_id=ObjectId(user_id),
-        threshold=threshold
+    await users_col.update_one(
+        {"_id": user.id},
+        {"$set": {"admin_id": new_admin.id}}
     )
     
-    reminders_col = get_collection("notification_reminders")
-    result = await reminders_col.insert_one(reminder.model_dump(by_alias=True))
-    
-    reminder_doc = await reminders_col.find_one({"_id": result.inserted_id})
-    return NotificationReminder(**reminder_doc)
+    updated_doc = await users_col.find_one({"_id": user.id})
+    return User(**updated_doc)
 
-async def get_notification_reminder(
-    user_id: Union[str, ObjectId], 
-    reminder_type: ReminderType, 
-    threshold: Optional[int] = None
-) -> Optional[NotificationReminder]:
-    """Retrieves a notification reminder for a user."""
-    query = {
-        "user_id": ObjectId(user_id),
-        "type": reminder_type
+
+async def remove_users(users: List[User]) -> None:
+    """Remove multiple users."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    proxies_col = get_database()[COLLECTIONS["proxies"]]
+    next_plans_col = get_database()[COLLECTIONS["next_plans"]]
+    
+    user_ids = [user.id for user in users]
+    
+    # Delete related documents
+    await proxies_col.delete_many({"user_id": {"$in": user_ids}})
+    await next_plans_col.delete_many({"user_id": {"$in": user_ids}})
+    
+    # Delete users
+    await users_col.delete_many({"_id": {"$in": user_ids}})
+
+
+async def count_online_users(hours: int) -> int:
+    """Count users online in the last N hours."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    since = datetime.utcnow() - timedelta(hours=hours)
+    
+    return await users_col.count_documents({
+        "online_at": {"$gte": since}
+    })
+
+
+async def get_all_users_usages(start: datetime, end: datetime, admin_username: Optional[str] = None) -> List[UserUsageResponse]:
+    """Get all users usage within date range."""
+    usages_col = get_database()[COLLECTIONS["node_user_usages"]]
+    users_col = get_database()[COLLECTIONS["users"]]
+    nodes_col = get_database()[COLLECTIONS["nodes"]]
+    
+    # Build user filter if admin specified
+    user_filter = {}
+    if admin_username:
+        admin = await get_admin(admin_username)
+        if admin:
+            user_filter["admin_id"] = admin.id
+    
+    # Get users
+    users_docs = await users_col.find(user_filter).to_list(length=None)
+    user_ids = [doc["_id"] for doc in users_docs]
+    
+    if not user_ids:
+        return []
+    
+    # Get nodes for mapping
+    nodes_docs = await nodes_col.find({}).to_list(length=None)
+    nodes_map = {str(doc["_id"]): doc["name"] for doc in nodes_docs}
+    nodes_map[None] = "Master"
+    
+    # Get usage data
+    pipeline = [
+        {
+            "$match": {
+                "user_id": {"$in": user_ids},
+                "created_at": {"$gte": start, "$lte": end}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$node_id",
+                "total_usage": {"$sum": "$used_traffic"}
+            }
+        }
+    ]
+    
+    usage_docs = await usages_col.aggregate(pipeline).to_list(length=None)
+    
+    result = []
+    for usage_doc in usage_docs:
+        node_id = str(usage_doc["_id"]) if usage_doc["_id"] else None
+        result.append(UserUsageResponse(
+            node_id=node_id,
+            node_name=nodes_map.get(node_id, "Unknown"),
+            used_traffic=usage_doc["total_usage"]
+        ))
+    
+    return result
+
+
+async def update_user_sub(user: User, user_agent: str) -> None:
+    """Update user subscription info."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    
+    await users_col.update_one(
+        {"_id": user.id},
+        {"$set": {
+            "sub_updated_at": datetime.utcnow(),
+            "sub_last_user_agent": user_agent
+        }}
+    )
+
+
+# Node CRUD operations
+async def get_nodes(enabled: bool = None) -> List[Node]:
+    """Get all nodes."""
+    nodes_col = get_database()[COLLECTIONS["nodes"]]
+    
+    query = {}
+    if enabled is not None:
+        query["status"] = {"$ne": NodeStatus.disabled} if enabled else NodeStatus.disabled
+    
+    nodes_docs = await nodes_col.find(query).to_list(length=None)
+    return [Node(**doc) for doc in nodes_docs]
+
+
+async def update_node(node: Node, modify: NodeModify) -> Node:
+    """Update node details."""
+    nodes_col = get_database()[COLLECTIONS["nodes"]]
+    
+    update_data = modify.model_dump(exclude_unset=True)
+    update_data["last_status_change"] = datetime.utcnow()
+    
+    await nodes_col.update_one(
+        {"_id": node.id},
+        {"$set": update_data}
+    )
+    
+    updated_doc = await nodes_col.find_one({"_id": node.id})
+    return Node(**updated_doc)
+
+
+async def remove_node(node: Node) -> None:
+    """Remove a node."""
+    nodes_col = get_database()[COLLECTIONS["nodes"]]
+    await nodes_col.delete_one({"_id": node.id})
+
+
+async def update_node_status(node: Node, status: NodeStatus, message: str = None, version: str = None) -> None:
+    """Update node status."""
+    nodes_col = get_database()[COLLECTIONS["nodes"]]
+    
+    update_data = {
+        "status": status,
+        "last_status_change": datetime.utcnow()
     }
     
-    if threshold is not None:
-        query["threshold"] = threshold
+    if message:
+        update_data["message"] = message
+    if version:
+        update_data["xray_version"] = version
     
-    reminders_col = get_collection("notification_reminders")
-    reminder_doc = await reminders_col.find_one(query)
-    
-    if not reminder_doc:
-        return None
-    
-    reminder = NotificationReminder(**reminder_doc)
-    
-    # Check if expired
-    if reminder.expires_at and reminder.expires_at < datetime.utcnow():
-        await reminders_col.delete_one({"_id": reminder.id})
-        return None
-    
-    return reminder
+    await nodes_col.update_one(
+        {"_id": node.id},
+        {"$set": update_data}
+    )
 
-async def delete_notification_reminder(reminder: NotificationReminder) -> None:
-    """Deletes a specific notification reminder."""
-    reminders_col = get_collection("notification_reminders")
-    await reminders_col.delete_one({"_id": reminder.id})
+
+async def get_nodes_usage(start: datetime, end: datetime) -> List[NodeUsageResponse]:
+    """Get nodes usage within date range."""
+    node_usages_col = get_database()[COLLECTIONS["node_usages"]]
+    nodes_col = get_database()[COLLECTIONS["nodes"]]
+    
+    # Get nodes for mapping
+    nodes_docs = await nodes_col.find({}).to_list(length=None)
+    nodes_map = {str(doc["_id"]): doc["name"] for doc in nodes_docs}
+    nodes_map[None] = "Master"
+    
+    # Get usage data
+    pipeline = [
+        {
+            "$match": {
+                "created_at": {"$gte": start, "$lte": end}
+            }
+        },
+        {
+            "$group": {
+                "_id": "$node_id",
+                "total_uplink": {"$sum": "$uplink"},
+                "total_downlink": {"$sum": "$downlink"}
+            }
+        }
+    ]
+    
+    usage_docs = await node_usages_col.aggregate(pipeline).to_list(length=None)
+    
+    result = []
+    for usage_doc in usage_docs:
+        node_id = str(usage_doc["_id"]) if usage_doc["_id"] else None
+        result.append(NodeUsageResponse(
+            node_id=node_id,
+            node_name=nodes_map.get(node_id, "Unknown"),
+            uplink=usage_doc["total_uplink"],
+            downlink=usage_doc["total_downlink"]
+        ))
+    
+    return result
+
+
+# User Template CRUD operations
+async def get_user_template_by_id(template_id: str) -> Optional[UserTemplate]:
+    """Get user template by ID."""
+    templates_col = get_database()[COLLECTIONS["user_templates"]]
+    template_doc = await templates_col.find_one({"_id": ObjectId(template_id)})
+    return UserTemplate(**template_doc) if template_doc else None
+
+
+async def get_user_templates(offset: Optional[int] = None, limit: Optional[int] = None) -> List[UserTemplate]:
+    """Get user templates."""
+    templates_col = get_database()[COLLECTIONS["user_templates"]]
+    
+    cursor = templates_col.find({})
+    
+    if offset:
+        cursor = cursor.skip(offset)
+    if limit:
+        cursor = cursor.limit(limit)
+    
+    templates_docs = await cursor.to_list(length=None)
+    return [UserTemplate(**doc) for doc in templates_docs]
+
+
+# System and stats functions
+async def update_system_usage(uplink: int, downlink: int) -> None:
+    """Update system usage."""
+    system_col = get_database()[COLLECTIONS["system"]]
+    
+    # Create system record if it doesn't exist
+    existing = await system_col.find_one({})
+    if not existing:
+        system = System(uplink=uplink, downlink=downlink)
+        await system_col.insert_one(system.model_dump(by_alias=True))
+    else:
+        await system_col.update_one(
+            {"_id": existing["_id"]},
+            {"$inc": {"uplink": uplink, "downlink": downlink}}
+        )
+
+
+# Usage tracking functions for jobs
+async def get_user_admin_mapping() -> Dict[str, str]:
+    """Get mapping of user_id to admin_id."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    
+    pipeline = [
+        {"$match": {"admin_id": {"$exists": True, "$ne": None}}},
+        {"$project": {"admin_id": 1}}
+    ]
+    
+    users_docs = await users_col.aggregate(pipeline).to_list(length=None)
+    return {str(doc["_id"]): str(doc["admin_id"]) for doc in users_docs}
+
+
+async def update_users_usage(users_usage: List[Dict]) -> None:
+    """Update multiple users usage."""
+    users_col = get_database()[COLLECTIONS["users"]]
+    
+    for usage in users_usage:
+        await users_col.update_one(
+            {"_id": ObjectId(usage["uid"])},
+            {"$inc": {"used_traffic": usage["value"]}, "$set": {"online_at": datetime.utcnow()}}
+        )
+
+
+async def update_admins_usage(admin_usage: Dict[str, int]) -> None:
+    """Update multiple admins usage."""
+    admins_col = get_database()[COLLECTIONS["admins"]]
+    
+    for admin_id, usage in admin_usage.items():
+        await admins_col.update_one(
+            {"_id": ObjectId(admin_id)},
+            {"$inc": {"users_usage": usage}}
+        )
+
+
+async def get_node_user_usages_for_hour(node_id: Optional[str], created_at: datetime) -> List[NodeUserUsage]:
+    """Get node user usages for a specific hour."""
+    usages_col = get_database()[COLLECTIONS["node_user_usages"]]
+    
+    query = {
+        "created_at": created_at,
+        "node_id": ObjectId(node_id) if node_id else None
+    }
+    
+    usages_docs = await usages_col.find(query).to_list(length=None)
+    return [NodeUserUsage(**doc) for doc in usages_docs]
+
+
+async def create_node_user_usages(user_ids: List[str], node_id: Optional[str], created_at: datetime) -> None:
+    """Create node user usage records."""
+    usages_col = get_database()[COLLECTIONS["node_user_usages"]]
+    
+    usages_data = []
+    for user_id in user_ids:
+        usage = NodeUserUsage(
+            user_id=ObjectId(user_id),
+            node_id=ObjectId(node_id) if node_id else None,
+            created_at=created_at,
+            used_traffic=0
+        )
+        usages_data.append(usage.model_dump(by_alias=True))
+    
+    if usages_data:
+        await usages_col.insert_many(usages_data)
+
+
+async def update_node_user_usage(user_id: str, node_id: Optional[str], created_at: datetime, usage: int) -> None:
+    """Update node user usage."""
+    usages_col = get_database()[COLLECTIONS["node_user_usages"]]
+    
+    await usages_col.update_one(
+        {
+            "user_id": ObjectId(user_id),
+            "node_id": ObjectId(node_id) if node_id else None,
+            "created_at": created_at
+        },
+        {"$inc": {"used_traffic": usage}}
+    )
+
+
+async def get_node_usage_for_hour(node_id: Optional[str], created_at: datetime) -> Optional[NodeUsage]:
+    """Get node usage for a specific hour."""
+    usages_col = get_database()[COLLECTIONS["node_usages"]]
+    
+    usage_doc = await usages_col.find_one({
+        "node_id": ObjectId(node_id) if node_id else None,
+        "created_at": created_at
+    })
+    
+    return NodeUsage(**usage_doc) if usage_doc else None
+
+
+async def create_node_usage(node_id: Optional[str], created_at: datetime) -> None:
+    """Create node usage record."""
+    usages_col = get_database()[COLLECTIONS["node_usages"]]
+    
+    usage = NodeUsage(
+        node_id=ObjectId(node_id) if node_id else None,
+        created_at=created_at,
+        uplink=0,
+        downlink=0
+    )
+    
+    await usages_col.insert_one(usage.model_dump(by_alias=True))
+
+
+async def update_node_usage(node_id: Optional[str], created_at: datetime, uplink: int, downlink: int) -> None:
+    """Update node usage."""
+    usages_col = get_database()[COLLECTIONS["node_usages"]]
+    
+    await usages_col.update_one(
+        {
+            "node_id": ObjectId(node_id) if node_id else None,
+            "created_at": created_at
+        },
+        {"$inc": {"uplink": uplink, "downlink": downlink}}
+    )

@@ -1,10 +1,11 @@
+# app/routers/subscription.py
 import re
 from distutils.version import LooseVersion
 
 from fastapi import APIRouter, Depends, Header, Path, Request, Response
 from fastapi.responses import HTMLResponse
 
-from app.db import Session, crud, get_db
+from app import db
 from app.dependencies import get_validated_sub, validate_dates
 from app.models.user import SubscriptionUserResponse, UserResponse
 from app.subscription.share import encode_title, generate_subscription
@@ -47,9 +48,8 @@ def get_subscription_user_info(user: UserResponse) -> dict:
 
 @router.get("/{token}/")
 @router.get("/{token}", include_in_schema=False)
-def user_subscription(
+async def user_subscription(
     request: Request,
-    db: Session = Depends(get_db),
     dbuser: UserResponse = Depends(get_validated_sub),
     user_agent: str = Header(default="")
 ):
@@ -65,7 +65,7 @@ def user_subscription(
             )
         )
 
-    crud.update_user_sub(db, dbuser, user_agent)
+    await db.update_user_sub(dbuser, user_agent)
     response_headers = {
         "content-disposition": f'attachment; filename="{user.username}"',
         "profile-web-page-url": str(request.url),
@@ -132,15 +132,13 @@ def user_subscription(
             conf = generate_subscription(user=user, config_format="v2ray", as_base64=True, reverse=False)
             return Response(content=conf, media_type="text/plain", headers=response_headers)
 
-
-
     else:
         conf = generate_subscription(user=user, config_format="v2ray", as_base64=True, reverse=False)
         return Response(content=conf, media_type="text/plain", headers=response_headers)
 
 
 @router.get("/{token}/info", response_model=SubscriptionUserResponse)
-def user_subscription_info(
+async def user_subscription_info(
     dbuser: UserResponse = Depends(get_validated_sub),
 ):
     """Retrieves detailed information about the user's subscription."""
@@ -148,26 +146,24 @@ def user_subscription_info(
 
 
 @router.get("/{token}/usage")
-def user_get_usage(
+async def user_get_usage(
     dbuser: UserResponse = Depends(get_validated_sub),
     start: str = "",
     end: str = "",
-    db: Session = Depends(get_db)
 ):
     """Fetches the usage statistics for the user within a specified date range."""
     start, end = validate_dates(start, end)
 
-    usages = crud.get_user_usages(db, dbuser, start, end)
+    usages = await db.get_user_usages(dbuser, start, end)
 
     return {"usages": usages, "username": dbuser.username}
 
 
 @router.get("/{token}/{client_type}")
-def user_subscription_with_client_type(
+async def user_subscription_with_client_type(
     request: Request,
     dbuser: UserResponse = Depends(get_validated_sub),
     client_type: str = Path(..., regex="sing-box|clash-meta|clash|outline|v2ray|v2ray-json"),
-    db: Session = Depends(get_db),
     user_agent: str = Header(default="")
 ):
     """Provides a subscription link based on the specified client type (e.g., Clash, V2Ray)."""
